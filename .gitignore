@@ -1,0 +1,6 @@
+/target
+*.rzdb
+
+# scratch test binaries for manual smoke-testing — keep them out of the tree
+/testbins/
+*.vizin-aliases.json
