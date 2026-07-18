@@ -4,7 +4,7 @@
 
 use super::{search_lines, Scroller};
 use crate::backend::{Annotation, DecompResult};
-use crate::ts::TsParser;
+use crate::ts::{Symbol, TsParser};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Paragraph};
 
@@ -33,16 +33,6 @@ pub struct DecompView {
     pub search_highlight: Option<String>,
     /// Tree-sitter C parser for AST-aware operations
     ts: TsParser,
-}
-
-/// What sits under the cursor in the decompiled code.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Symbol {
-    Function { name: String, addr: u64 },
-    Global { addr: u64 },
-    Local { name: String },
-    Param { name: String },
-    None,
 }
 
 impl DecompView {
@@ -85,16 +75,11 @@ impl DecompView {
         self.result.as_ref().map_or(&[], |r| r.annotations.as_slice())
     }
 
-    /// Full decompiled source text (needed for tree-sitter parsing).
-    fn full_code(&self) -> &str {
-        &self.code_cache
-    }
-
     /// Address associated with the cursor position (nearest enclosing offset annotation).
     pub fn addr_at_cursor(&self) -> Option<u64> {
         let pos = self.byte_pos()?;
         for a in self.annotations() {
-            if a.atype == "offset" && a.start <= pos && pos < a.end {
+            if a.kind == "offset" && a.start <= pos && pos < a.end {
                 if let Some(o) = a.offset {
                     return Some(o);
                 }
@@ -103,7 +88,7 @@ impl DecompView {
         // fall back: offset annotation whose start is nearest to cursor byte position
         self.annotations()
             .iter()
-            .filter(|a| a.atype == "offset")
+            .filter(|a| a.kind == "offset")
             .filter_map(|a| a.offset.map(|o| (a.start, o)))
             .min_by_key(|(s, _)| s.abs_diff(pos))
             .map(|(_, o)| o)
@@ -118,7 +103,7 @@ impl DecompView {
         };
         for a in self.annotations() {
             if a.start <= pos && pos < a.end {
-                match a.atype.as_str() {
+                match a.kind.as_str() {
                     "function_name" => {
                         if let (Some(n), Some(o)) = (&a.name, a.offset) {
                             return Symbol::Function {
@@ -129,7 +114,10 @@ impl DecompView {
                     }
                     "global_variable" | "constant_variable" => {
                         if let Some(o) = a.offset {
-                            return Symbol::Global { addr: o };
+                            return Symbol::Global {
+                                name: a.name.clone().unwrap_or_default(),
+                                addr: o,
+                            };
                         }
                     }
                     "local_variable" => {
@@ -147,20 +135,14 @@ impl DecompView {
             }
         }
         // Fallback: use tree-sitter AST (no address info available)
-        match self.ts.symbol_at(&self.code_cache, pos) {
-            crate::ts::TsSymbol::Function { name, .. } => Symbol::Function { name, addr: 0 },
-            crate::ts::TsSymbol::Global { .. } => Symbol::Global { addr: 0 },
-            crate::ts::TsSymbol::Local { name } => Symbol::Local { name },
-            crate::ts::TsSymbol::Param { name } => Symbol::Param { name },
-            crate::ts::TsSymbol::None => Symbol::None,
-        }
+        self.ts.symbol_at(&self.code_cache, pos)
     }
 
     /// Move the cursor to the first line whose code maps to `addr`.
     pub fn cursor_to_addr(&mut self, addr: u64) {
         let mut best: Option<(u64, usize)> = None; // (distance, byte_start)
         for a in self.annotations() {
-            if a.atype == "offset" {
+            if a.kind == "offset" {
                 if let Some(o) = a.offset {
                     let dist = o.abs_diff(addr);
                     if best.is_none_or(|(d, _)| dist < d) {
@@ -376,15 +358,19 @@ impl DecompView {
                             self.scroller.ensure_visible();
                             return;
                         }
-                        // Fallback: byte-level depth scan
-                        let target = if b == op {
-                            Self::scan_bracket_fwd_static(&self.lines, li, ci, op, cl)
+                        // Fallback: byte-level depth scan (no string/comment
+                        // awareness, since tree-sitter already failed to
+                        // resolve a match) over the flat `code_cache` buffer.
+                        let bytes = self.code_cache.as_bytes();
+                        let target_abs = if b == op {
+                            TsParser::scan_forward(bytes, abs, op, cl, |_| false)
                         } else {
-                            Self::scan_bracket_back_static(&self.lines, li, ci, op, cl)
+                            TsParser::scan_backward(bytes, abs, op, cl, |_| false)
                         };
-                        if let Some(target) = target {
-                            self.scroller.set_cursor(target.0);
-                            self.col = target.1;
+                        if let Some(target_abs) = target_abs {
+                            let line = self.line_of_byte(target_abs);
+                            self.col = target_abs - self.line_starts.get(line).copied().unwrap_or(0);
+                            self.scroller.set_cursor(line);
                             self.scroller.ensure_visible();
                             return;
                         }
@@ -393,77 +379,6 @@ impl DecompView {
                 }
             }
         }
-    }
-
-    fn scan_bracket_fwd_static(
-        lines: &[String],
-        start_line: usize, start_col: usize, open: u8, close: u8,
-    ) -> Option<(usize, usize)> {
-        let mut depth: i64 = 1;
-        for (li, line) in lines.iter().enumerate().skip(start_line) {
-            let bytes = line.as_bytes();
-            let from = if li == start_line { start_col + 1 } else { 0 };
-            for (ci, &b) in bytes.iter().enumerate().skip(from) {
-                if b == open {
-                    depth += 1;
-                } else if b == close {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some((li, ci));
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    fn scan_bracket_back_static(
-        lines: &[String],
-        start_line: usize, start_col: usize, open: u8, close: u8,
-    ) -> Option<(usize, usize)> {
-        let mut depth: i64 = 1;
-        for idx in (0..=start_line).rev() {
-            let Some(line) = lines.get(idx) else {
-                continue;
-            };
-            let bytes = line.as_bytes();
-            let to = if idx == start_line {
-                let Some(t) = start_col.checked_sub(1) else {
-                    continue;
-                };
-                t
-            } else {
-                bytes.len().saturating_sub(1)
-            };
-            for ci in (0..=to).rev() {
-                let Some(&b) = bytes.get(ci) else {
-                    continue;
-                };
-                if b == close {
-                    depth += 1;
-                } else if b == open {
-                    depth -= 1;
-                    if depth == 0 {
-                        return Some((idx, ci));
-                    }
-                }
-            }
-        }
-        None
-    }
-
-    /// Byte range (start, end) of the function enclosing the cursor.
-    pub fn scope_at_cursor(&mut self) -> Option<(usize, usize)> {
-        let pos = self.byte_pos()?;
-        self.ts.enclosing_function(&self.code_cache, pos)
-    }
-
-    /// Find all occurrences of the identifier at the cursor (excluding strings/comments).
-    pub fn references_at_cursor(&mut self) -> Vec<usize> {
-        let Some(word) = self.word_at_cursor_inner() else {
-            return vec![];
-        };
-        self.ts.find_references(&self.code_cache, &word)
     }
 
     pub fn search(&mut self, pattern: &str, forward: bool) -> bool {
@@ -539,7 +454,7 @@ impl DecompView {
     fn style_map(&self, from_byte: usize, to_byte: usize) -> Vec<(usize, usize, Style)> {
         let mut spans = Vec::new();
         for a in self.annotations() {
-            if a.atype == "syntax_highlight" && a.end > from_byte && a.start < to_byte {
+            if a.kind == "syntax_highlight" && a.end > from_byte && a.start < to_byte {
                 if let Some(kind) = &a.syntax_highlight {
                     spans.push((a.start, a.end, Self::highlight_style(kind)));
                 }
@@ -547,35 +462,6 @@ impl DecompView {
         }
         spans.sort_by_key(|s| s.0);
         spans
-    }
-
-    /// Split `text` into spans, highlighting every occurrence of `pat`.
-    fn hl_spans(text: &str, style: Style, pat: Option<&str>) -> Vec<Span<'static>> {
-        let Some(pat) = pat else {
-            return vec![Span::styled(text.to_string(), style)];
-        };
-        if pat.is_empty() {
-            return vec![Span::styled(text.to_string(), style)];
-        }
-        let low = text.to_lowercase();
-        let plow = pat.to_lowercase();
-        let mut out = Vec::new();
-        let mut start = 0;
-        while let Some(pos) = low[start..].find(&plow) {
-            let abs = start + pos;
-            if abs > start {
-                out.push(Span::styled(text[start..abs].to_string(), style));
-            }
-            out.push(Span::styled(
-                text[abs..abs + plow.len()].to_string(),
-                style.bg(Color::Rgb(80, 60, 0)),
-            ));
-            start = abs + plow.len();
-        }
-        if start < text.len() {
-            out.push(Span::styled(text[start..].to_string(), style));
-        }
-        out
     }
 
     /// Build one rendered line: horizontal-scroll clipping + syntax/search highlighting.
@@ -617,17 +503,17 @@ impl DecompView {
                 continue;
             }
             if s > cursor_b {
-                spans.extend(Self::hl_spans(
+                spans.extend(Scroller::highlight_spans(
                     &line[cursor_b - lstart..s - lstart],
                     default_fg,
                     hl,
                 ));
             }
-            spans.extend(Self::hl_spans(&line[s - lstart..e - lstart], base.patch(st), hl));
+            spans.extend(Scroller::highlight_spans(&line[s - lstart..e - lstart], base.patch(st), hl));
             cursor_b = e;
         }
         if cursor_b < vis_abs_end {
-            spans.extend(Self::hl_spans(
+            spans.extend(Scroller::highlight_spans(
                 &line[cursor_b - lstart..vis_end],
                 default_fg,
                 hl,
@@ -639,20 +525,15 @@ impl DecompView {
         Line::from(spans)
     }
 
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool, title_fn: &str) {
-        self.scroller.height = area.height.saturating_sub(2) as usize;
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool, fn_name: &str) {
+        self.scroller.begin_frame(area, 2);
         self.viewport_width = area.width.saturating_sub(2) as usize; // minus borders
-        self.scroller.ensure_visible();
         self.sync_hscroll();
-        let border_style = if focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
+        let border_style = Scroller::border_style(focused);
         let block = Block::default()
             .borders(Borders::ALL)
             .border_style(border_style)
-            .title(format!(" Decompiler — {title_fn} "));
+            .title(format!(" Decompiler — {fn_name} "));
 
         // No code yet: show the status notice (decompiling…, analyzing…, error).
         if self.lines.is_empty() {
@@ -687,8 +568,7 @@ impl DecompView {
         // draw a column cursor when focused
         if focused {
             if let Some(line) = self.lines.get(self.scroller.cursor) {
-                let row = u16::try_from(self.scroller.cursor.saturating_sub(self.scroller.scroll))
-                    .unwrap_or(u16::MAX);
+                let row = u16::try_from(self.scroller.visible_row()).unwrap_or(u16::MAX);
                 let col_abs = self.col.min(line.len().saturating_sub(1));
                 let col = i32::try_from(col_abs).unwrap_or(i32::MAX)
                     - i32::try_from(self.hscroll).unwrap_or(i32::MAX);

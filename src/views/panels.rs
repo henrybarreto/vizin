@@ -1,10 +1,10 @@
 //! Generic list panels: strings, imports, exports, segments.
 
-use super::{search_lines, Scroller};
+use super::Scroller;
 use crate::backend::Backend;
 use anyhow::Result;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PanelKind {
@@ -48,7 +48,7 @@ impl PanelView {
                         "{:>10x}  {:<18} {:<8} {}",
                         s.vaddr,
                         s.section,
-                        s.stype,
+                        s.kind,
                         s.string.replace('\n', "\\n")
                     ),
                 })
@@ -62,7 +62,7 @@ impl PanelView {
                         "{:>10}  {:<6} {:<8} {}",
                         i.plt.map(|a| format!("{a:x}")).unwrap_or_default(),
                         i.bind,
-                        i.itype,
+                        i.kind,
                         i.name
                     ),
                 })
@@ -72,7 +72,7 @@ impl PanelView {
                 .into_iter()
                 .map(|e| PanelRow {
                     addr: Some(e.vaddr),
-                    text: format!("{:>10x}  {:<8} {:<6} {}", e.vaddr, e.etype, e.size, e.name),
+                    text: format!("{:>10x}  {:<8} {:<6} {}", e.vaddr, e.kind, e.size, e.name),
                 })
                 .collect(),
             PanelKind::Segments => backend
@@ -100,43 +100,18 @@ impl PanelView {
 
     pub fn search(&mut self, pattern: &str, forward: bool) -> bool {
         let lines: Vec<String> = self.rows.iter().map(|r| r.text.clone()).collect();
-        if let Some(idx) = search_lines(&lines, pattern, self.scroller.cursor, forward) {
-            self.scroller.set_cursor(idx);
-            true
-        } else {
-            false
-        }
+        self.scroller.search(&lines, pattern, forward)
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
-        self.scroller.height = area.height.saturating_sub(2) as usize;
-        self.scroller.ensure_visible();
-        let border_style = if focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
-        let lines: Vec<Line> = self
-            .rows
-            .iter()
-            .enumerate()
-            .skip(self.scroller.scroll)
-            .take(self.scroller.height)
-            .map(|(pos, r)| {
-                let style = if pos == self.scroller.cursor {
-                    Style::default().bg(Color::Blue).fg(Color::White)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                Line::from(Span::styled(r.text.clone(), style))
-            })
-            .collect();
-        let para = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(format!(" {} ({}) — Enter: goto, q: close ", self.kind.title(), self.rows.len())),
-        );
-        frame.render_widget(para, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Scroller::border_style(focused))
+            .title(format!(" {} ({}) — Enter: goto, q: close ", self.kind.title(), self.rows.len()));
+        let rows = &self.rows;
+        self.scroller.render_list(frame, area, block, rows.len(), |pos, selected| {
+            let style = Scroller::row_style(selected);
+            Line::from(Span::styled(rows.get(pos).map_or_else(String::new, |r| r.text.clone()), style))
+        });
     }
 }

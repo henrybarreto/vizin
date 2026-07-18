@@ -4,7 +4,7 @@
 
 use super::Scroller;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear};
 
 /// Ex-command names completed by `:` + Tab, in `:h wildmode`-style `full` order.
 pub const COMMANDS: &[&str] = &[
@@ -72,29 +72,18 @@ impl CompletionPopup {
             width: w,
             height: h,
         };
-        self.scroller.height = popup.height.saturating_sub(2) as usize;
-        self.scroller.ensure_visible();
-        let lines: Vec<Line> = self
-            .filtered
-            .iter()
-            .enumerate()
-            .skip(self.scroller.scroll)
-            .take(self.scroller.height)
-            .map(|(pos, cmd)| {
-                let style = if pos == self.scroller.cursor {
-                    Style::default().bg(Color::DarkGray).fg(Color::White)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                Line::from(Span::styled(cmd.as_str(), style))
-            })
-            .collect();
         frame.render_widget(Clear, popup);
-        let para = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan)),
-        );
-        frame.render_widget(para, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan));
+        let filtered = &self.filtered;
+        self.scroller.render_list(frame, popup, block, filtered.len(), |pos, selected| {
+            let style = if selected {
+                Style::default().bg(Color::DarkGray).fg(Color::White)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            Line::from(Span::styled(filtered.get(pos).cloned().unwrap_or_default(), style))
+        });
     }
 }

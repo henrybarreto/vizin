@@ -29,21 +29,11 @@ impl HelpPopup {
         self.rows.len()
     }
 
-    pub const fn is_empty(&self) -> bool {
-        self.rows.is_empty()
-    }
-
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let w = (area.width * 2 / 3).clamp(50, 70).min(area.width);
-        let h = (area.height * 3 / 4).clamp(10, 26).min(area.height);
-        let popup = Rect {
-            x: area.x + (area.width.saturating_sub(w)) / 2,
-            y: area.y + (area.height.saturating_sub(h)) / 2,
-            width: w,
-            height: h,
-        };
-        self.scroller.height = popup.height.saturating_sub(2) as usize;
-        self.scroller.ensure_visible();
+        let w = (area.width * 2 / 3).clamp(50, 70);
+        let h = (area.height * 3 / 4).clamp(10, 26);
+        let popup = Scroller::centered_rect(area, w, h);
+        self.scroller.begin_frame(popup, 2);
         let lines: Vec<Line> = self
             .rows
             .iter()

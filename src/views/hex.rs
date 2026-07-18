@@ -1,5 +1,6 @@
 //! Hex view with vim navigation and insert-mode byte patching.
 
+use super::Scroller;
 use crate::backend::Backend;
 use crate::vim::Action;
 use anyhow::Result;
@@ -18,8 +19,10 @@ pub struct HexView {
     pub edits: BTreeMap<u64, u8>,
     pub cursor: usize, // byte index in window
     pub nibble: bool,  // false = high nibble
-    pub scroll: usize, // row offset
-    pub height: usize,
+    /// Row-level viewport bookkeeping: `scroller.scroll`/`.height` track the
+    /// same row space as `cursor / COLS`; `scroller.cursor` is kept in sync
+    /// with that row on every cursor-moving operation.
+    pub scroller: Scroller,
     pub editing: bool,
 }
 
@@ -33,8 +36,7 @@ impl HexView {
             edits: BTreeMap::new(),
             cursor: usize::try_from(addr - base).unwrap_or(0),
             nibble: false,
-            scroll: 0,
-            height: 0,
+            scroller: Scroller::default(),
             editing: false,
         })
     }
@@ -45,7 +47,7 @@ impl HexView {
 
     /// Row index of the cursor within the currently visible viewport.
     pub const fn cursor_row_in_view(&self) -> usize {
-        (self.cursor / COLS).saturating_sub(self.scroll)
+        (self.cursor / COLS).saturating_sub(self.scroller.scroll)
     }
 
     pub fn seek(&mut self, backend: &mut Backend, addr: u64) -> Result<()> {
@@ -53,7 +55,7 @@ impl HexView {
             let base = addr & !0xf;
             self.bytes = backend.read_bytes(base, WINDOW)?;
             self.base = base;
-            self.scroll = 0;
+            self.scroller.scroll = 0;
         }
         self.cursor = usize::try_from(addr - self.base).unwrap_or(0);
         self.nibble = false;
@@ -71,15 +73,16 @@ impl HexView {
     fn step_for(&self, action: Action) -> Option<i64> {
         let to_i64 = |n: usize| i64::try_from(n).unwrap_or(i64::MAX);
         let cols = to_i64(COLS);
+        let height = self.scroller.height;
         Some(match action {
             Action::Left(n) => -to_i64(n),
             Action::Right(n) => to_i64(n),
             Action::Up(n) => -(to_i64(n) * cols),
             Action::Down(n) => to_i64(n) * cols,
-            Action::HalfPageUp => -(to_i64(self.height.max(2) / 2) * cols),
-            Action::HalfPageDown => to_i64(self.height.max(2) / 2) * cols,
-            Action::PageUp => -(to_i64(self.height.max(1)) * cols),
-            Action::PageDown => to_i64(self.height.max(1)) * cols,
+            Action::HalfPageUp => -(to_i64(height.max(2) / 2) * cols),
+            Action::HalfPageDown => to_i64(height.max(2) / 2) * cols,
+            Action::PageUp => -(to_i64(height.max(1)) * cols),
+            Action::PageDown => to_i64(height.max(1)) * cols,
             _ => return None,
         })
     }
@@ -100,7 +103,7 @@ impl HexView {
             }
             Action::ScrollCursorMiddle => {
                 let row = self.cursor / COLS;
-                self.scroll = row.saturating_sub(self.height.max(1) / 2);
+                self.scroller.scroll = row.saturating_sub(self.scroller.height.max(1) / 2);
                 return Ok(true);
             }
             _ => {}
@@ -121,14 +124,11 @@ impl HexView {
         Ok(true)
     }
 
+    /// Sync the row-level `scroller` to the current byte cursor, then clamp
+    /// scroll to keep it visible.
     fn ensure_visible(&mut self) {
-        let row = self.cursor / COLS;
-        let h = self.height.max(1);
-        if row < self.scroll {
-            self.scroll = row;
-        } else if row >= self.scroll + h {
-            self.scroll = row + 1 - h;
-        }
+        self.scroller.cursor = self.cursor / COLS;
+        self.scroller.ensure_visible();
     }
 
     /// Type one hex digit in insert mode.
@@ -190,18 +190,18 @@ impl HexView {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
-        self.height = area.height.saturating_sub(2) as usize;
-        self.ensure_visible();
+        // Sync the row-level scroller to the byte cursor before begin_frame
+        // clamps scroll, so that clamp only has to run once per render.
+        self.scroller.cursor = self.cursor / COLS;
+        self.scroller.begin_frame(area, 2);
         let border_style = if self.editing {
             Style::default().fg(Color::LightRed)
-        } else if focused {
-            Style::default().fg(Color::Cyan)
         } else {
-            Style::default().fg(Color::DarkGray)
+            Scroller::border_style(focused)
         };
         let rows = self.bytes.len().div_ceil(COLS);
         let mut lines: Vec<Line> = Vec::new();
-        for row in self.scroll..(self.scroll + self.height).min(rows) {
+        for row in self.scroller.scroll..(self.scroller.scroll + self.scroller.height).min(rows) {
             let addr = self.base + u64::try_from(row * COLS).unwrap_or(u64::MAX);
             let mut spans = vec![Span::styled(
                 format!("{addr:>10x}  "),

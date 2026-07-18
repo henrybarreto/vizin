@@ -1,10 +1,9 @@
 //! vizin — vim-style TUI disassembler/decompiler on rizin + Ghidra (rz-ghidra).
 
-// Several backend structs mirror rizin's JSON schema; not every field is rendered yet.
-#![allow(dead_code)]
-
 mod app;
 mod backend;
+mod cmdline;
+mod command;
 mod decompiler;
 mod pipe;
 mod ts;

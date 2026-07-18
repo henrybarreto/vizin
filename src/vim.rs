@@ -61,36 +61,35 @@ enum PendingResult {
     Resolved(Option<Action>),
 }
 
-// These `pending_*` fields are mutually exclusive single-key lookahead
-// states of the parser and would be cleaner as one `Pending` enum; left as
-// bools for now since `feed()` below is a well-tested hot path — see task #6.
+/// Single-key lookahead state: which multi-key sequence prefix (if any) is
+/// awaiting its second key.
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum Pending {
+    #[default]
+    None,
+    G,
+    Z,
+    CtrlW,
+    /// waiting for the target char after `f`
+    FindNext,
+    /// waiting for the target char after `F`
+    FindPrev,
+    /// waiting for the second key after `[`
+    OpenBracket,
+    /// waiting for the second key after `]`
+    CloseBracket,
+}
+
 #[derive(Default)]
-#[allow(clippy::struct_excessive_bools)]
 pub struct NormalParser {
     count: Option<usize>,
-    pending_g: bool,
-    pending_z: bool,
-    pending_ctrl_w: bool,
-    /// true when waiting for the target char after `f`
-    pending_f: bool,
-    /// true when waiting for the target char after `F`
-    pending_upper_f: bool,
-    /// true when waiting for the second key after `[`
-    pending_open_bracket: bool,
-    /// true when waiting for the second key after `]`
-    pending_close_bracket: bool,
+    pending: Pending,
 }
 
 impl NormalParser {
     pub const fn reset(&mut self) {
         self.count = None;
-        self.pending_g = false;
-        self.pending_z = false;
-        self.pending_ctrl_w = false;
-        self.pending_f = false;
-        self.pending_upper_f = false;
-        self.pending_open_bracket = false;
-        self.pending_close_bracket = false;
+        self.pending = Pending::None;
     }
 
     /// Feed one key event; returns an Action when a complete sequence is recognized.
@@ -110,7 +109,7 @@ impl NormalParser {
         self.reset();
         // Ctrl-w is a prefix for window navigation (like vim)
         if key.code == KeyCode::Char('w') {
-            self.pending_ctrl_w = true;
+            self.pending = Pending::CtrlW;
             return None;
         }
         match key.code {
@@ -126,76 +125,27 @@ impl NormalParser {
 
     /// If a multi-key sequence (`g?`, `z?`, `Ctrl-w ?`, `f?`, `F?`, `[?`, `]?`) is
     /// pending, consume this key as its second half.
-    const fn feed_pending(&mut self, key: KeyEvent) -> PendingResult {
-        if self.pending_g {
-            self.pending_g = false;
-            self.count = None;
-            return PendingResult::Resolved(match key.code {
-                KeyCode::Char('g') => Some(Action::Top),
-                KeyCode::Char('d') => Some(Action::Follow),
-                _ => None,
-            });
+    fn feed_pending(&mut self, key: KeyEvent) -> PendingResult {
+        let pending = std::mem::replace(&mut self.pending, Pending::None);
+        if pending == Pending::None {
+            return PendingResult::None;
         }
-
-        if self.pending_z {
-            self.pending_z = false;
-            self.count = None;
-            return PendingResult::Resolved(match key.code {
-                KeyCode::Char('z') => Some(Action::ScrollCursorMiddle),
-                KeyCode::Char('t') => Some(Action::ScrollCursorTop),
-                KeyCode::Char('b') => Some(Action::ScrollCursorBottom),
-                _ => None,
-            });
-        }
-
-        if self.pending_ctrl_w {
-            self.pending_ctrl_w = false;
-            self.count = None;
-            return PendingResult::Resolved(match key.code {
-                KeyCode::Char('h') => Some(Action::FocusSidebar),
-                KeyCode::Char('l') => Some(Action::FocusMain),
-                KeyCode::Char('w') => Some(Action::CycleFocus),
-                _ => None,
-            });
-        }
-
-        if self.pending_f {
-            self.pending_f = false;
-            self.count = None;
-            return PendingResult::Resolved(match key.code {
-                KeyCode::Char(c) => Some(Action::FindNext(c)),
-                _ => None,
-            });
-        }
-
-        if self.pending_upper_f {
-            self.pending_upper_f = false;
-            self.count = None;
-            return PendingResult::Resolved(match key.code {
-                KeyCode::Char(c) => Some(Action::FindPrev(c)),
-                _ => None,
-            });
-        }
-
-        if self.pending_open_bracket {
-            self.pending_open_bracket = false;
-            self.count = None;
-            return PendingResult::Resolved(match key.code {
-                KeyCode::Char('{') => Some(Action::ToPrevBrace),
-                _ => None,
-            });
-        }
-
-        if self.pending_close_bracket {
-            self.pending_close_bracket = false;
-            self.count = None;
-            return PendingResult::Resolved(match key.code {
-                KeyCode::Char('}') => Some(Action::ToNextBrace),
-                _ => None,
-            });
-        }
-
-        PendingResult::None
+        self.count = None;
+        PendingResult::Resolved(match (pending, key.code) {
+            (Pending::G, KeyCode::Char('g')) => Some(Action::Top),
+            (Pending::G, KeyCode::Char('d')) => Some(Action::Follow),
+            (Pending::Z, KeyCode::Char('z')) => Some(Action::ScrollCursorMiddle),
+            (Pending::Z, KeyCode::Char('t')) => Some(Action::ScrollCursorTop),
+            (Pending::Z, KeyCode::Char('b')) => Some(Action::ScrollCursorBottom),
+            (Pending::CtrlW, KeyCode::Char('h')) => Some(Action::FocusSidebar),
+            (Pending::CtrlW, KeyCode::Char('l')) => Some(Action::FocusMain),
+            (Pending::CtrlW, KeyCode::Char('w')) => Some(Action::CycleFocus),
+            (Pending::FindNext, KeyCode::Char(c)) => Some(Action::FindNext(c)),
+            (Pending::FindPrev, KeyCode::Char(c)) => Some(Action::FindPrev(c)),
+            (Pending::OpenBracket, KeyCode::Char('{')) => Some(Action::ToPrevBrace),
+            (Pending::CloseBracket, KeyCode::Char('}')) => Some(Action::ToNextBrace),
+            _ => None,
+        })
     }
 
     /// Dispatch a key with no pending sequence and no Ctrl modifier: counts,
@@ -213,27 +163,27 @@ impl NormalParser {
                 None
             }
             KeyCode::Char('g') => {
-                self.pending_g = true;
+                self.pending = Pending::G;
                 None
             }
             KeyCode::Char('z') => {
-                self.pending_z = true;
+                self.pending = Pending::Z;
                 None
             }
             KeyCode::Char('f') => {
-                self.pending_f = true;
+                self.pending = Pending::FindNext;
                 None
             }
             KeyCode::Char('F') => {
-                self.pending_upper_f = true;
+                self.pending = Pending::FindPrev;
                 None
             }
             KeyCode::Char('[') => {
-                self.pending_open_bracket = true;
+                self.pending = Pending::OpenBracket;
                 None
             }
             KeyCode::Char(']') => {
-                self.pending_close_bracket = true;
+                self.pending = Pending::CloseBracket;
                 None
             }
             code => {

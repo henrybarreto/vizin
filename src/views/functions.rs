@@ -5,7 +5,7 @@
 use super::Scroller;
 use crate::backend::FunctionInfo;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, List, ListItem};
+use ratatui::widgets::{Block, Borders};
 
 #[derive(Default)]
 #[allow(clippy::module_name_repetitions)] // matches sibling `*View` naming
@@ -63,45 +63,32 @@ impl FunctionsView {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool) {
-        self.scroller.height = area.height.saturating_sub(2) as usize;
-        self.scroller.ensure_visible();
-        let border_style = if focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
         let title = if self.filter.is_empty() {
             format!(" Functions ({}) ", self.filtered.len())
         } else {
             format!(" Functions /{} ({}) ", self.filter, self.filtered.len())
         };
-        let items: Vec<ListItem> = self
-            .filtered
-            .iter()
-            .enumerate()
-            .skip(self.scroller.scroll)
-            .take(self.scroller.height)
-            .filter_map(|(pos, &i)| {
-                let f = self.all.get(i)?;
-                let style = if pos == self.scroller.cursor {
-                    Style::default().bg(Color::Blue).fg(Color::White).bold()
-                } else if focused {
-                    Style::default().fg(Color::Gray)
-                } else {
-                    Style::default().fg(Color::DarkGray)
-                };
-                Some(ListItem::new(Line::from(vec![
-                    Span::styled(format!("{:>10x} ", f.offset), style.fg(Color::DarkGray)),
-                    Span::styled(f.name.clone(), style),
-                ])))
-            })
-            .collect();
-        let list = List::new(items).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(border_style)
-                .title(title),
-        );
-        frame.render_widget(list, area);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Scroller::border_style(focused))
+            .title(title);
+        let filtered = &self.filtered;
+        let all = &self.all;
+        self.scroller.render_list(frame, area, block, filtered.len(), |pos, selected| {
+            let Some(f) = filtered.get(pos).and_then(|&i| all.get(i)) else {
+                return Line::default();
+            };
+            let style = if selected {
+                Style::default().bg(Color::Blue).fg(Color::White).bold()
+            } else if focused {
+                Style::default().fg(Color::Gray)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            Line::from(vec![
+                Span::styled(format!("{:>10x} ", f.offset), style.fg(Color::DarkGray)),
+                Span::styled(f.name.clone(), style),
+            ])
+        });
     }
 }

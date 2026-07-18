@@ -12,8 +12,6 @@ pub struct FunctionInfo {
     pub name: String,
     #[serde(default)]
     pub size: u64,
-    #[serde(default)]
-    pub signature: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -24,15 +22,11 @@ pub struct Instr {
     #[serde(default)]
     pub disasm: String,
     #[serde(default)]
-    pub opcode: String,
-    #[serde(default)]
     pub bytes: String,
     #[serde(default, rename = "type")]
-    pub itype: String,
+    pub kind: String,
     #[serde(default)]
     pub jump: Option<u64>,
-    #[serde(default)]
-    pub fail: Option<u64>,
     /// data/pointer this instruction references (e.g. a `lea reg, str.Foo`
     /// operand) — rizin's `ptr` field, only meaningful when `refptr` is set.
     #[serde(default)]
@@ -59,7 +53,7 @@ pub struct Annotation {
     pub start: usize,
     pub end: usize,
     #[serde(rename = "type")]
-    pub atype: String,
+    pub kind: String,
     #[serde(default)]
     pub offset: Option<u64>,
     #[serde(default)]
@@ -79,13 +73,11 @@ pub struct DecompResult {
 pub struct Xref {
     pub from: u64,
     #[serde(default, rename = "type")]
-    pub xtype: String,
+    pub kind: String,
     #[serde(default)]
     pub opcode: String,
     #[serde(default)]
     pub fcn_name: Option<String>,
-    #[serde(default)]
-    pub refname: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -93,7 +85,7 @@ pub struct XrefFrom {
     #[serde(rename = "to")]
     pub to: u64,
     #[serde(default, rename = "type")]
-    pub xtype: String,
+    pub kind: String,
     #[serde(default)]
     pub name: Option<String>,
 }
@@ -102,11 +94,9 @@ pub struct XrefFrom {
 pub struct StringInfo {
     pub vaddr: u64,
     #[serde(default)]
-    pub length: u64,
-    #[serde(default)]
     pub section: String,
     #[serde(default, rename = "type")]
-    pub stype: String,
+    pub kind: String,
     #[serde(default)]
     pub string: String,
 }
@@ -116,7 +106,7 @@ pub struct ImportInfo {
     #[serde(default)]
     pub name: String,
     #[serde(default, rename = "type")]
-    pub itype: String,
+    pub kind: String,
     #[serde(default)]
     pub bind: String,
     #[serde(default)]
@@ -130,7 +120,7 @@ pub struct ExportInfo {
     #[serde(default)]
     pub vaddr: u64,
     #[serde(default, rename = "type")]
-    pub etype: String,
+    pub kind: String,
     #[serde(default)]
     pub size: u64,
 }
@@ -153,10 +143,6 @@ pub struct BinInfo {
     pub arch: String,
     #[serde(default)]
     pub bits: u64,
-    #[serde(default, rename = "class")]
-    pub class: String,
-    #[serde(default)]
-    pub endian: String,
 }
 
 pub struct Backend {
@@ -167,8 +153,13 @@ pub struct Backend {
 }
 
 impl Backend {
-    fn from_value<T: serde::de::DeserializeOwned>(v: serde_json::Value, what: &str) -> Result<T> {
-        serde_json::from_value(v).with_context(|| format!("unexpected JSON shape for {what}"))
+    fn from_value<T: serde::de::DeserializeOwned>(v: serde_json::Value, cmd: &str) -> Result<T> {
+        serde_json::from_value(v).with_context(|| format!("unexpected JSON shape for {cmd}"))
+    }
+
+    /// Run a rizin JSON command and deserialize its output as `T`.
+    fn query<T: serde::de::DeserializeOwned>(&mut self, cmd: &str) -> Result<T> {
+        Self::from_value(self.pipe.cmdj(cmd)?, cmd)
     }
 
     pub fn open(file: &str, writable: bool, project: Option<&str>) -> Result<Self> {
@@ -195,7 +186,7 @@ impl Backend {
     }
 
     pub fn functions(&mut self) -> Result<Vec<FunctionInfo>> {
-        Self::from_value(self.pipe.cmdj("aflj")?, "aflj")
+        self.query("aflj")
     }
 
     pub fn function_at(&mut self, addr: u64) -> Result<Option<FunctionInfo>> {
@@ -205,42 +196,38 @@ impl Backend {
     }
 
     pub fn disasm(&mut self, addr: u64, count: usize) -> Result<Vec<Instr>> {
-        Self::from_value(
-            self.pipe.cmdj(&format!("pdj {count} @ {addr:#x}"))?,
-            "pdj",
-        )
+        self.query(&format!("pdj {count} @ {addr:#x}"))
     }
 
     /// Best-effort backwards disassembly ending just before `addr`.
     pub fn disasm_back(&mut self, addr: u64, count: usize) -> Result<Vec<Instr>> {
-        let v = self.pipe.cmdj(&format!("pdj -{count} @ {addr:#x}"))?;
-        let mut instrs: Vec<Instr> = Self::from_value(v, "pdj -N")?;
+        let mut instrs: Vec<Instr> = self.query(&format!("pdj -{count} @ {addr:#x}"))?;
         instrs.retain(|i| i.offset < addr);
         Ok(instrs)
     }
 
     pub fn xrefs_to(&mut self, addr: u64) -> Result<Vec<Xref>> {
-        Self::from_value(self.pipe.cmdj(&format!("axtj @ {addr:#x}"))?, "axtj")
+        self.query(&format!("axtj @ {addr:#x}"))
     }
 
     pub fn xrefs_from(&mut self, addr: u64) -> Result<Vec<XrefFrom>> {
-        Self::from_value(self.pipe.cmdj(&format!("axfj @ {addr:#x}"))?, "axfj")
+        self.query(&format!("axfj @ {addr:#x}"))
     }
 
     pub fn strings(&mut self) -> Result<Vec<StringInfo>> {
-        Self::from_value(self.pipe.cmdj("izzj")?, "izzj")
+        self.query("izzj")
     }
 
     pub fn imports(&mut self) -> Result<Vec<ImportInfo>> {
-        Self::from_value(self.pipe.cmdj("iij")?, "iij")
+        self.query("iij")
     }
 
     pub fn exports(&mut self) -> Result<Vec<ExportInfo>> {
-        Self::from_value(self.pipe.cmdj("iEj")?, "iEj")
+        self.query("iEj")
     }
 
     pub fn segments(&mut self) -> Result<Vec<SegmentInfo>> {
-        Self::from_value(self.pipe.cmdj("iSj")?, "iSj")
+        self.query("iSj")
     }
 
     /// Resolve an address expression: hex/dec number, symbol or flag name.
@@ -311,8 +298,7 @@ impl Backend {
         struct StringAt {
             string: String,
         }
-        let v = self.pipe.cmdj(&format!("psj @ {addr:#x}"))?;
-        let s: StringAt = Self::from_value(v, "psj")?;
+        let s: StringAt = self.query(&format!("psj @ {addr:#x}"))?;
         if s.string.is_empty() {
             bail!("no string at {addr:#x}");
         }
@@ -370,9 +356,7 @@ impl Backend {
     }
 
     pub fn read_bytes(&mut self, addr: u64, len: usize) -> Result<Vec<u8>> {
-        let v = self.pipe.cmdj(&format!("pxj {len} @ {addr:#x}"))?;
-        let nums: Vec<u8> = Self::from_value(v, "pxj")?;
-        Ok(nums)
+        self.query(&format!("pxj {len} @ {addr:#x}"))
     }
 
     pub fn write_bytes(&mut self, addr: u64, bytes: &[u8]) -> Result<()> {

@@ -40,15 +40,13 @@ impl App {
         let mut anchor_rect = col_main;
         match self.main_view {
             MainView::Panel => {
-                if let Some(mut p) = self.panel.take() {
+                if let Some(p) = self.panel.as_mut() {
                     p.render(frame, col_main, main_focus);
-                    self.panel = Some(p);
                 }
             }
             MainView::Hex => {
-                if let Some(mut h) = self.hex.take() {
+                if let Some(h) = self.hex.as_mut() {
                     h.render(frame, col_main, main_focus);
-                    self.hex = Some(h);
                 }
             }
             MainView::Listing | MainView::Decomp => {
@@ -85,19 +83,16 @@ impl App {
             }
         }
 
-        if let Some(mut popup) = self.popup.take() {
+        if let Some(popup) = self.popup.as_mut() {
             popup.render(frame, row_main);
-            self.popup = Some(popup);
         }
 
-        if let Some(mut help) = self.help_popup.take() {
+        if let Some(help) = self.help_popup.as_mut() {
             help.render(frame, row_main);
-            self.help_popup = Some(help);
         }
 
-        if let Some(mut cp) = self.completion_popup.take() {
+        if let Some(cp) = self.completion_popup.as_mut() {
             cp.render(frame, area, row_cmd.y);
-            self.completion_popup = Some(cp);
         }
 
         if let Some(vp) = &self.value_popup {

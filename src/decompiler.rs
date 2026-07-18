@@ -9,14 +9,14 @@ use crate::pipe::RzPipe;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread::{self, JoinHandle};
 
-enum Req {
+enum DecompRequest {
     Decompile(u64),
     /// forward an edit command (rename/comment) to keep this instance in sync
     Exec(String),
     Shutdown,
 }
 
-pub enum Msg {
+pub enum DecompEvent {
     /// analysis finished — the decompiler is now usable
     Ready,
     Done { addr: u64, result: Box<DecompResult> },
@@ -24,8 +24,8 @@ pub enum Msg {
 }
 
 pub struct Decompiler {
-    tx: Sender<Req>,
-    rx: Receiver<Msg>,
+    tx: Sender<DecompRequest>,
+    rx: Receiver<DecompEvent>,
     handle: Option<JoinHandle<()>>,
     pub ready: bool,
 }
@@ -45,19 +45,19 @@ impl Decompiler {
     }
 
     pub fn request(&self, addr: u64) {
-        let _ = self.tx.send(Req::Decompile(addr));
+        let _ = self.tx.send(DecompRequest::Decompile(addr));
     }
 
     /// Apply an edit command on the decompiler instance too (keeps names synced).
     pub fn forward(&self, cmd: String) {
-        let _ = self.tx.send(Req::Exec(cmd));
+        let _ = self.tx.send(DecompRequest::Exec(cmd));
     }
 
     /// Drain all pending messages without blocking.
-    pub fn poll(&mut self) -> Vec<Msg> {
+    pub fn poll(&mut self) -> Vec<DecompEvent> {
         let mut out = Vec::new();
         while let Ok(m) = self.rx.try_recv() {
-            if matches!(m, Msg::Ready) {
+            if matches!(m, DecompEvent::Ready) {
                 self.ready = true;
             }
             out.push(m);
@@ -68,20 +68,20 @@ impl Decompiler {
 
 impl Drop for Decompiler {
     fn drop(&mut self) {
-        let _ = self.tx.send(Req::Shutdown);
+        let _ = self.tx.send(DecompRequest::Shutdown);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
     }
 }
 
-fn worker(file: &str, project: Option<&str>, rx: &Receiver<Req>, tx: &Sender<Msg>) {
+fn worker(file: &str, project: Option<&str>, rx: &Receiver<DecompRequest>, tx: &Sender<DecompEvent>) {
     let Ok(mut pipe) = RzPipe::open(file, false, project) else {
         return;
     };
     // Decompilation quality depends on analysis; run it once up front.
     let _ = pipe.cmd("aaa");
-    if tx.send(Msg::Ready).is_err() {
+    if tx.send(DecompEvent::Ready).is_err() {
         return;
     }
 
@@ -100,11 +100,11 @@ fn worker(file: &str, project: Option<&str>, rx: &Receiver<Req>, tx: &Sender<Msg
         let mut shutdown = false;
         for r in queue {
             match r {
-                Req::Decompile(addr) => target = Some(addr),
-                Req::Exec(cmd) => {
+                DecompRequest::Decompile(addr) => target = Some(addr),
+                DecompRequest::Exec(cmd) => {
                     let _ = pipe.cmd(&cmd);
                 }
-                Req::Shutdown => {
+                DecompRequest::Shutdown => {
                     shutdown = true;
                     break;
                 }
@@ -113,16 +113,16 @@ fn worker(file: &str, project: Option<&str>, rx: &Receiver<Req>, tx: &Sender<Msg
         if let Some(addr) = target {
             let msg = match pipe.cmdj(&format!("pdgj @ {addr:#x}")) {
                 Ok(v) => match serde_json::from_value::<DecompResult>(v) {
-                    Ok(res) => Msg::Done {
+                    Ok(res) => DecompEvent::Done {
                         addr,
                         result: Box::new(res),
                     },
-                    Err(e) => Msg::Failed {
+                    Err(e) => DecompEvent::Failed {
                         addr,
                         error: e.to_string(),
                     },
                 },
-                Err(e) => Msg::Failed {
+                Err(e) => DecompEvent::Failed {
                     addr,
                     error: format!("{e:#}"),
                 },

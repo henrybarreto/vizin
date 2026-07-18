@@ -1,14 +1,15 @@
 //! Application state and event dispatch: focus, modes, jumplist, editing.
 
 use crate::backend::{Backend, Instr};
-use crate::decompiler::{DecompCache, Decompiler, Msg};
+use crate::decompiler::{DecompCache, DecompEvent, Decompiler};
+use crate::ts::Symbol;
 use crate::views::completion::CompletionPopup;
-use crate::views::decomp::{DecompView, Symbol};
+use crate::views::decomp::DecompView;
 use crate::views::functions::FunctionsView;
 use crate::views::help::HelpPopup;
 use crate::views::hex::HexView;
 use crate::views::listing::ListingView;
-use crate::views::panels::{PanelKind, PanelView};
+use crate::views::panels::PanelView;
 use crate::views::xrefs::{XrefRow, XrefsPopup};
 use crate::vim::{Action, NormalParser};
 use anyhow::Result;
@@ -62,6 +63,38 @@ pub struct InputState {
     pub buffer: String,
 }
 
+/// Background-decompiler orchestration state: the worker handle and its
+/// result cache, which function the pane should show, what's currently
+/// shown/in-flight, and cursor-sync bookkeeping.
+struct DecompState {
+    decompiler: Option<Decompiler>,
+    cache: DecompCache,
+    /// function we want the decomp pane to show (None = no function at cursor)
+    desired_fn: Option<u64>,
+    /// when `desired_fn` last changed (debounce timer)
+    desired_since: Instant,
+    /// function currently populated in the decomp view
+    shown: Option<u64>,
+    /// function whose decompile request is in flight
+    inflight: Option<u64>,
+    /// seek address last synced into the decompiler cursor position
+    synced_seek: u64,
+}
+
+impl DecompState {
+    fn new(decompiler: Option<Decompiler>) -> Self {
+        Self {
+            decompiler,
+            cache: DecompCache::new(8),
+            desired_fn: None,
+            desired_since: Instant::now(),
+            shown: None,
+            inflight: None,
+            synced_seek: 0,
+        }
+    }
+}
+
 // Each bool below is an independent, orthogonal flag (quit vs. dirty vs.
 // message severity vs. layout mode) rather than combinable state that would
 // read better as an enum — see task #6 if that changes.
@@ -93,18 +126,7 @@ pub struct App {
     pub project_path: Option<String>,
     pub dual_pane: bool,
     // ----- background decompiler -----
-    decompiler: Option<Decompiler>,
-    decomp_cache: DecompCache,
-    /// function we want the decomp pane to show (None = no function at cursor)
-    desired_fn: Option<u64>,
-    /// when `desired_fn` last changed (debounce timer)
-    desired_since: Instant,
-    /// function currently populated in the decomp view
-    decomp_shown: Option<u64>,
-    /// function whose decompile request is in flight
-    decomp_inflight: Option<u64>,
-    /// seek address last synced into the decompiler cursor position
-    decomp_synced_seek: u64,
+    decomp_state: DecompState,
     /// spinner animation frame
     pub spinner: usize,
     /// Display-only names for Ghidra-only decompiler temporaries (pcVar8, iVar4…)
@@ -168,13 +190,7 @@ impl App {
             search_pattern: String::new(),
             project_path: project,
             dual_pane: false,
-            decompiler,
-            decomp_cache: DecompCache::new(8),
-            desired_fn: None,
-            desired_since: Instant::now(),
-            decomp_shown: None,
-            decomp_inflight: None,
-            decomp_synced_seek: 0,
+            decomp_state: DecompState::new(decompiler),
             spinner: 0,
             local_aliases,
             aliases_path,
@@ -278,17 +294,17 @@ impl App {
         lines
     }
 
-    fn info(&mut self, msg: impl Into<String>) {
+    pub fn info(&mut self, msg: impl Into<String>) {
         self.message = msg.into();
         self.message_is_error = false;
     }
 
-    fn error(&mut self, msg: impl Into<String>) {
+    pub fn error(&mut self, msg: impl Into<String>) {
         self.message = msg.into();
         self.message_is_error = true;
     }
 
-    fn report<T>(&mut self, r: Result<T>) -> Option<T> {
+    pub fn report<T>(&mut self, r: Result<T>) -> Option<T> {
         match r {
             Ok(v) => Some(v),
             Err(e) => {
@@ -318,6 +334,19 @@ impl App {
             self.back_stack.push(self.seek);
             self.fwd_stack.clear();
         }
+        self.sync_seek_to_listing(addr);
+        if self.main_view == MainView::Hex {
+            if let Some(mut hex) = self.hex.take() {
+                let r = hex.seek(&mut self.backend, addr);
+                self.report(r);
+                self.hex = Some(hex);
+            }
+        }
+    }
+
+    /// Point `seek` at `addr`, and load/scroll the listing pane + sidebar
+    /// selection to match. Shared by `goto` and the decomp-pane cursor sync.
+    fn sync_seek_to_listing(&mut self, addr: u64) {
         self.seek = addr;
         if self.listing.contains(addr) {
             self.listing.cursor_to_addr(addr);
@@ -326,13 +355,6 @@ impl App {
             self.report(r);
         }
         self.funcs.select_addr(addr);
-        if self.main_view == MainView::Hex {
-            if let Some(mut hex) = self.hex.take() {
-                let r = hex.seek(&mut self.backend, addr);
-                self.report(r);
-                self.hex = Some(hex);
-            }
-        }
     }
 
     fn jump_back(&mut self) {
@@ -360,7 +382,7 @@ impl App {
         self.dual_pane = width >= 160
             && matches!(self.main_view, MainView::Listing | MainView::Decomp);
         let decomp_visible = self.main_view == MainView::Decomp || self.dual_pane;
-        if !decomp_visible || self.decompiler.is_none() {
+        if !decomp_visible || self.decomp_state.decompiler.is_none() {
             return;
         }
 
@@ -373,33 +395,33 @@ impl App {
             .map(|f| f.offset);
 
         // (Re)start the debounce timer whenever the target changes.
-        if self.desired_fn != target {
-            self.desired_fn = target;
-            self.desired_since = Instant::now();
+        if self.decomp_state.desired_fn != target {
+            self.decomp_state.desired_fn = target;
+            self.decomp_state.desired_since = Instant::now();
         }
 
         let Some(f) = target else {
-            if self.decomp_shown.is_some() || !self.decomp.lines.is_empty() {
+            if self.decomp_state.shown.is_some() || !self.decomp.lines.is_empty() {
                 self.decomp.clear();
             }
             self.decomp.notice = Some("(no function at cursor)".into());
-            self.decomp_shown = None;
+            self.decomp_state.shown = None;
             return;
         };
 
-        if self.decomp_shown == Some(f) {
+        if self.decomp_state.shown == Some(f) {
             self.decomp.notice = None;
-            if self.decomp_synced_seek != self.seek {
+            if self.decomp_state.synced_seek != self.seek {
                 self.decomp.cursor_to_addr(self.seek);
-                self.decomp_synced_seek = self.seek;
+                self.decomp_state.synced_seek = self.seek;
             }
             return;
         }
-        if let Some(res) = self.decomp_cache.get(f) {
+        if let Some(res) = self.decomp_state.cache.get(f) {
             self.decomp.set(res, f);
-            self.decomp_shown = Some(f);
+            self.decomp_state.shown = Some(f);
             self.decomp.cursor_to_addr(self.seek);
-            self.decomp_synced_seek = self.seek;
+            self.decomp_state.synced_seek = self.seek;
             return;
         }
 
@@ -408,32 +430,32 @@ impl App {
         if !self.decomp.lines.is_empty() {
             self.decomp.clear();
         }
-        self.decomp_shown = None;
-        let ready = self.decompiler.as_ref().is_some_and(|d| d.ready);
+        self.decomp_state.shown = None;
+        let ready = self.decomp_state.decompiler.as_ref().is_some_and(|d| d.ready);
         if !ready {
             self.decomp.notice = Some("decompiler: analyzing binary…".into());
             return;
         }
         self.decomp.notice = Some(format!("{} decompiling {}…", self.spinner_char(), self.fn_label(f)));
-        if self.desired_since.elapsed() >= DECOMP_DEBOUNCE && self.decomp_inflight != Some(f) {
-            if let Some(d) = &self.decompiler {
+        if self.decomp_state.desired_since.elapsed() >= DECOMP_DEBOUNCE && self.decomp_state.inflight != Some(f) {
+            if let Some(d) = &self.decomp_state.decompiler {
                 d.request(f);
             }
-            self.decomp_inflight = Some(f);
+            self.decomp_state.inflight = Some(f);
         }
     }
 
     /// True while the decomp pane is visible but not yet showing the target.
     pub fn decomp_waiting(&self) -> bool {
-        self.decompiler.is_some()
+        self.decomp_state.decompiler.is_some()
             && (self.main_view == MainView::Decomp || self.dual_pane)
-            && self.desired_fn.is_some()
-            && self.decomp_shown != self.desired_fn
+            && self.decomp_state.desired_fn.is_some()
+            && self.decomp_state.shown != self.decomp_state.desired_fn
     }
 
     /// Drain results from the background decompiler. Returns true if anything changed.
     pub fn poll_decomp(&mut self) -> bool {
-        let msgs = match &mut self.decompiler {
+        let msgs = match &mut self.decomp_state.decompiler {
             Some(d) => d.poll(),
             None => return false,
         };
@@ -441,29 +463,29 @@ impl App {
         for m in msgs {
             changed = true;
             match m {
-                Msg::Ready => {}
-                Msg::Done { addr, result } => {
-                    self.decomp_cache.put(addr, *result);
-                    if self.decomp_inflight == Some(addr) {
-                        self.decomp_inflight = None;
+                DecompEvent::Ready => {}
+                DecompEvent::Done { addr, result } => {
+                    self.decomp_state.cache.put(addr, *result);
+                    if self.decomp_state.inflight == Some(addr) {
+                        self.decomp_state.inflight = None;
                     }
-                    if self.desired_fn == Some(addr) {
-                        if let Some(res) = self.decomp_cache.get(addr) {
+                    if self.decomp_state.desired_fn == Some(addr) {
+                        if let Some(res) = self.decomp_state.cache.get(addr) {
                             self.decomp.set(res, addr);
-                            self.decomp_shown = Some(addr);
+                            self.decomp_state.shown = Some(addr);
                             self.decomp.cursor_to_addr(self.seek);
-                            self.decomp_synced_seek = self.seek;
+                            self.decomp_state.synced_seek = self.seek;
                         }
                     }
                 }
-                Msg::Failed { addr, error } => {
-                    if self.decomp_inflight == Some(addr) {
-                        self.decomp_inflight = None;
+                DecompEvent::Failed { addr, error } => {
+                    if self.decomp_state.inflight == Some(addr) {
+                        self.decomp_state.inflight = None;
                     }
-                    if self.desired_fn == Some(addr) {
+                    if self.decomp_state.desired_fn == Some(addr) {
                         self.decomp.clear();
                         self.decomp.notice = Some(format!("decompile failed: {error}"));
-                        self.decomp_shown = None;
+                        self.decomp_state.shown = None;
                     }
                 }
             }
@@ -489,8 +511,8 @@ impl App {
 
     /// Replay an edit command on the background decompiler instance so its
     /// decompiled output shows the same names/comments.
-    fn forward_edit(&self, cmd: String) {
-        if let Some(d) = &self.decompiler {
+    pub fn forward_edit(&self, cmd: String) {
+        if let Some(d) = &self.decomp_state.decompiler {
             d.forward(cmd);
         }
     }
@@ -498,13 +520,13 @@ impl App {
     /// Best-effort persist of `local_aliases` to a sidecar JSON file next to
     /// the binary — these are vizin-only display hints, not part of any rizin
     /// project, so they don't round-trip through `Ps`/`-p`.
-    fn save_aliases(&self) {
+    pub fn save_aliases(&self) {
         if let Ok(s) = serde_json::to_string_pretty(&self.local_aliases) {
             let _ = std::fs::write(&self.aliases_path, s);
         }
     }
 
-    fn refresh_after_edit(&mut self) {
+    pub fn refresh_after_edit(&mut self) {
         let fns = self.backend.functions().unwrap_or_default();
         let filter = self.funcs.filter.clone();
         self.funcs.set_functions(fns);
@@ -513,10 +535,28 @@ impl App {
         self.report(r);
         // Names changed — drop cached decompilations (callers may show the new
         // name too) and re-show the current function from scratch.
-        self.decomp_cache.clear();
-        self.decomp_shown = None;
-        self.decomp_inflight = None;
+        self.invalidate_decomp(true);
         self.funcs.select_addr(self.seek);
+    }
+
+    /// Drop cached/shown decompilations so the pane re-decompiles from
+    /// scratch — used whenever an edit could change the decompiled output.
+    ///
+    /// `drop_inflight` decides what happens to a decompile request already
+    /// queued on the background worker for the current function:
+    /// - `true` (renames, byte patches): the edit can change what that
+    ///   in-flight request produces, so treat it as stale — clearing
+    ///   `inflight` makes `prepare()` queue a fresh request instead of
+    ///   waiting on one that may reflect pre-edit state.
+    /// - `false` (comments): the decompiled code structure is unaffected,
+    ///   so the in-flight request (if any) is still good — leaving it alone
+    ///   avoids firing a redundant duplicate request for the same function.
+    pub fn invalidate_decomp(&mut self, drop_inflight: bool) {
+        self.decomp_state.cache.clear();
+        self.decomp_state.shown = None;
+        if drop_inflight {
+            self.decomp_state.inflight = None;
+        }
     }
 
     // ---------- key handling ----------
@@ -709,16 +749,10 @@ impl App {
         match action {
             Action::Follow => self.follow_from_listing(),
             Action::XrefsTo => self.show_xrefs_to(self.seek),
-            Action::XrefsFrom => self.show_xrefs_from(self.seek),
-            Action::ToggleView => self.toggle_decomp(),
             Action::Rename => self.rename_at_listing_cursor(),
             Action::Comment => self.start_comment(self.seek),
-            Action::SearchNext => self.repeat_search(true),
-            Action::SearchPrev => self.repeat_search(false),
-            Action::SearchWordNext | Action::SearchWordPrev => self.search_word(action),
             Action::ShowValue => self.show_value_at_listing_cursor(),
-            Action::Close => self.info("use :q to quit"),
-            _ => {}
+            _ => self.handle_common_action(action),
         }
     }
 
@@ -734,15 +768,21 @@ impl App {
                 return;
             }
         }
-        if let Some(word) = self.listing.word_at_cursor() {
+        let word = self.listing.word_at_cursor();
+        self.show_value_or_word(word, self.seek, row, comment);
+    }
+
+    /// Shared tail of `show_value_at_*_cursor`: try the word under the
+    /// cursor as a number, else fall back to `addr` itself.
+    fn show_value_or_word(&mut self, word: Option<String>, addr: u64, row: usize, comment: Option<String>) {
+        if let Some(word) = word {
             if let Some(v) = Self::parse_numeric(&word) {
                 self.open_value_popup(&word, v, row);
                 self.append_comment_line(comment);
                 return;
             }
         }
-        let a = self.seek;
-        self.open_value_popup(&format!("{a:#x}"), a, row);
+        self.open_value_popup(&format!("{addr:#x}"), addr, row);
         self.append_comment_line(comment);
     }
 
@@ -812,14 +852,7 @@ impl App {
         let len = self.decomp.lines.len();
         if self.decomp.scroller.handle(action, len) {
             if let Some(a) = self.decomp.addr_at_cursor() {
-                self.seek = a;
-                if self.listing.contains(a) {
-                    self.listing.cursor_to_addr(a);
-                } else {
-                    let r = self.listing.load(&mut self.backend, a);
-                    self.report(r);
-                }
-                self.funcs.select_addr(a);
+                self.sync_seek_to_listing(a);
             }
             return;
         }
@@ -827,23 +860,32 @@ impl App {
             Action::Follow => self.follow_from_decomp(),
             Action::XrefsTo => {
                 let addr = match self.decomp.symbol_at_cursor() {
-                    Symbol::Function { addr, .. } | Symbol::Global { addr } => addr,
+                    Symbol::Function { addr, .. } | Symbol::Global { addr, .. } => addr,
                     _ => self.seek,
                 };
                 self.show_xrefs_to(addr);
             }
-            Action::XrefsFrom => self.show_xrefs_from(self.seek),
-            Action::ToggleView => self.toggle_decomp(),
             Action::Rename => self.rename_at_decomp_cursor(),
             Action::Comment => {
                 if let Some(a) = self.decomp.addr_at_cursor() {
                     self.start_comment(a);
                 }
             }
+            Action::ShowValue => self.show_value_at_decomp_cursor(),
+            _ => self.handle_common_action(action),
+        }
+    }
+
+    /// Actions handled identically by the listing and decomp panes: search
+    /// (both text and word-under-cursor), the listing↔decomp toggle, xrefs
+    /// from the current seek, and the "use :q to quit" hint on close.
+    fn handle_common_action(&mut self, action: Action) {
+        match action {
+            Action::XrefsFrom => self.show_xrefs_from(self.seek),
+            Action::ToggleView => self.toggle_decomp(),
             Action::SearchNext => self.repeat_search(true),
             Action::SearchPrev => self.repeat_search(false),
             Action::SearchWordNext | Action::SearchWordPrev => self.search_word(action),
-            Action::ShowValue => self.show_value_at_decomp_cursor(),
             Action::Close => self.info("use :q to quit"),
             _ => {}
         }
@@ -853,7 +895,7 @@ impl App {
         let row = self.decomp.scroller.visible_row();
         let addr_here = self.decomp.addr_at_cursor();
         let comment = addr_here.and_then(|a| self.backend.comment_at(a).ok().flatten());
-        if let Symbol::Global { addr } = self.decomp.symbol_at_cursor() {
+        if let Symbol::Global { addr, .. } = self.decomp.symbol_at_cursor() {
             if let Ok(s) = self.backend.string_at(addr) {
                 self.open_value_popup_str(&format!("{addr:#x}"), addr, row, Some(s));
                 self.append_comment_line(comment);
@@ -875,24 +917,15 @@ impl App {
             self.append_comment_line(comment);
             return;
         }
-        if let Some(word) = self.decomp.word_at_cursor() {
-            if let Some(v) = Self::parse_numeric(&word) {
-                self.open_value_popup(&word, v, row);
-                self.append_comment_line(comment);
-                return;
-            }
-        }
-        let a = addr_here.unwrap_or(self.seek);
-        self.open_value_popup(&format!("{a:#x}"), a, row);
-        self.append_comment_line(comment);
+        let word = self.decomp.word_at_cursor();
+        self.show_value_or_word(word, addr_here.unwrap_or(self.seek), row, comment);
     }
 
     fn on_hex_action(&mut self, action: Action) {
-        let Some(mut hex) = self.hex.take() else {
-            self.main_view = self.prev_view;
+        let Some(hex) = self.hex.as_mut() else {
+            self.exit_overlay();
             return;
         };
-        let mut keep = true;
         match action {
             Action::Insert => {
                 if self.backend.writable {
@@ -903,42 +936,44 @@ impl App {
                 }
             }
             Action::Close | Action::ToggleView => {
-                self.main_view = self.prev_view;
-                keep = false;
-                self.goto(hex.addr_at_cursor(), false);
+                let addr = hex.addr_at_cursor();
+                self.close_hex(addr, false);
             }
             Action::Follow => {
-                self.goto(hex.addr_at_cursor(), true);
-                self.main_view = self.prev_view;
-                keep = false;
+                let addr = hex.addr_at_cursor();
+                self.close_hex(addr, true);
             }
             Action::ShowValue => {
+                let addr = hex.addr_at_cursor();
                 let v = hex
                     .edits
-                    .get(&hex.addr_at_cursor())
+                    .get(&addr)
                     .copied()
                     .or_else(|| hex.bytes.get(hex.cursor).copied())
                     .unwrap_or(0);
                 let row = hex.cursor_row_in_view();
-                self.open_value_popup(&format!("{:#x}", hex.addr_at_cursor()), u64::from(v), row);
+                self.open_value_popup(&format!("{addr:#x}"), u64::from(v), row);
             }
             other => {
                 let r = hex.handle(other, &mut self.backend);
-                self.report(r);
                 self.seek = hex.addr_at_cursor();
+                self.report(r);
             }
         }
-        if keep {
-            self.hex = Some(hex);
-        } else {
-            self.hex = None;
-        }
+    }
+
+    /// Leave the hex view, jumping to `addr` in the restored view (`follow`
+    /// pushes a jumplist entry; a plain close does not).
+    fn close_hex(&mut self, addr: u64, follow: bool) {
+        self.exit_overlay();
+        self.hex = None;
+        self.goto(addr, follow);
     }
 
     fn on_hex_edit_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Esc | KeyCode::Enter => {
-                let Some(mut hx) = self.hex.take() else { return };
+                let Some(hx) = self.hex.as_mut() else { return };
                 hx.editing = false;
                 let n = hx.commit(&mut self.backend);
                 match n {
@@ -949,15 +984,12 @@ impl App {
                         self.error(format!("{e:#}"));
                     }
                 }
-                self.hex = Some(hx);
                 // patched bytes change disassembly and decompilation
                 let r = self.listing.reload(&mut self.backend);
                 self.report(r);
-                self.decomp_cache.clear();
-                self.decomp_shown = None;
-                self.decomp_inflight = None;
+                self.invalidate_decomp(true);
                 // tell the worker to reload the (now-patched) file from disk
-                if let Some(d) = &self.decompiler {
+                if let Some(d) = &self.decomp_state.decompiler {
                     d.forward("oo".into());
                 }
             }
@@ -976,7 +1008,7 @@ impl App {
 
     fn on_panel_action(&mut self, action: Action) {
         let Some(panel) = self.panel.as_mut() else {
-            self.main_view = self.prev_view;
+            self.exit_overlay();
             return;
         };
         let len = panel.rows.len();
@@ -995,16 +1027,14 @@ impl App {
             }
             Action::Close => {
                 self.panel = None;
-                self.main_view = self.prev_view;
+                self.exit_overlay();
             }
             Action::XrefsTo => {
                 if let Some(addr) = panel.selected_addr() {
                     self.show_xrefs_to(addr);
                 }
             }
-            Action::SearchNext => self.repeat_search(true),
-            Action::SearchPrev => self.repeat_search(false),
-            _ => {}
+            _ => self.handle_common_action(action),
         }
     }
 
@@ -1032,7 +1062,7 @@ impl App {
 
     fn follow_from_decomp(&mut self) {
         match self.decomp.symbol_at_cursor() {
-            Symbol::Function { addr, .. } | Symbol::Global { addr } => {
+            Symbol::Function { addr, .. } | Symbol::Global { addr, .. } => {
                 self.goto(addr, true);
             }
             _ => {
@@ -1057,7 +1087,7 @@ impl App {
                         text: format!(
                             "{:>10x}  {:<6} {:<24} {}",
                             x.from,
-                            x.xtype,
+                            x.kind,
                             x.fcn_name.clone().unwrap_or_default(),
                             x.opcode
                         ),
@@ -1086,7 +1116,7 @@ impl App {
                 text: format!(
                     "{:>10x}  {:<6} {}",
                     x.to,
-                    x.xtype,
+                    x.kind,
                     x.name.clone().unwrap_or_default()
                 ),
             })
@@ -1151,7 +1181,7 @@ impl App {
             Symbol::Function { name, addr } => {
                 self.start_rename(RenameTarget::Function(addr), &name);
             }
-            Symbol::Global { addr } => self.start_rename(RenameTarget::Flag(addr), ""),
+            Symbol::Global { addr, .. } => self.start_rename(RenameTarget::Flag(addr), ""),
             Symbol::Local { name } | Symbol::Param { name } => {
                 let fcn = self.decomp.fcn_addr;
                 // Prefill with the existing alias (if any) so re-renaming continues
@@ -1182,222 +1212,7 @@ impl App {
         });
     }
 
-    // ---------- input line ----------
-
-    /// Move the completion-popup selection and mirror it into the command buffer.
-    fn cycle_completion(&mut self, dir: Action) {
-        let Some(popup) = self.completion_popup.as_mut() else {
-            return;
-        };
-        popup.scroller.handle(dir, popup.filtered.len());
-        let Some(sel) = popup.selected().map(str::to_string) else {
-            return;
-        };
-        if let Some(input) = self.input.as_mut() {
-            input.buffer = sel;
-        }
-    }
-
-    fn on_input_key(&mut self, key: KeyEvent) {
-        // Handle completion popup navigation first
-        if let Some(popup) = self.completion_popup.as_mut() {
-            if popup.is_empty() {
-                self.completion_popup = None;
-            } else {
-                match key.code {
-                    KeyCode::Up | KeyCode::Char('k')
-                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        self.cycle_completion(Action::Up(1));
-                        return;
-                    }
-                    KeyCode::Down | KeyCode::Char('j')
-                        if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                    {
-                        self.cycle_completion(Action::Down(1));
-                        return;
-                    }
-                    KeyCode::Tab => {
-                        self.cycle_completion(Action::Down(1));
-                        return;
-                    }
-                    KeyCode::BackTab => {
-                        self.cycle_completion(Action::Up(1));
-                        return;
-                    }
-                    KeyCode::Esc => {
-                        self.completion_popup = None;
-                        return;
-                    }
-                    KeyCode::Enter => {
-                        self.completion_popup = None;
-                        let Some(input) = self.input.take() else {
-                            return;
-                        };
-                        self.submit_input(input);
-                        return;
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        let Some(input) = self.input.as_mut() else {
-            return;
-        };
-        match key.code {
-            KeyCode::Esc => {
-                if input.kind == InputKind::Search && self.focus == Focus::Sidebar {
-                    self.funcs.set_filter("");
-                }
-                self.completion_popup = None;
-                self.input = None;
-            }
-            KeyCode::Backspace => {
-                input.buffer.pop();
-                self.completion_popup = None;
-                if input.kind == InputKind::Search && self.focus == Focus::Sidebar {
-                    let f = input.buffer.clone();
-                    self.funcs.set_filter(&f);
-                }
-            }
-            KeyCode::Enter => {
-                if let Some(input) = self.input.take() {
-                    self.submit_input(input);
-                }
-            }
-            KeyCode::Tab if input.kind == InputKind::Command => {
-                self.tab_complete_command();
-            }
-            KeyCode::Char(c)
-                if !key.modifiers.contains(KeyModifiers::CONTROL) =>
-            {
-                input.buffer.push(c);
-                self.completion_popup = None;
-                if input.kind == InputKind::Search && self.focus == Focus::Sidebar {
-                    let f = input.buffer.clone();
-                    self.funcs.set_filter(&f);
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn tab_complete_command(&mut self) {
-        let Some(input) = self.input.as_ref() else {
-            return;
-        };
-        // Like nvim's cmdline completion: only the command name (the first
-        // token) is completed. Once a space follows it, the user is typing
-        // arguments we don't have completions for — leave the line alone
-        // rather than reporting bogus "no matches" against the whole line.
-        if input.buffer.contains(' ') {
-            return;
-        }
-        let prefix = input.buffer.trim().to_string();
-        let matches: Vec<&str> = crate::views::completion::COMMANDS
-            .iter()
-            .copied()
-            .filter(|c| c.starts_with(&prefix))
-            .collect();
-        if matches.is_empty() {
-            self.info(format!("no matches for: {prefix}"));
-        } else if let [only] = matches.as_slice() {
-            if let Some(input) = self.input.as_mut() {
-                input.buffer = (*only).to_string();
-            }
-            self.completion_popup = None;
-        } else {
-            let mut popup = CompletionPopup::new(crate::views::completion::COMMANDS);
-            popup.filter(&prefix);
-            if let Some(sel) = popup.selected() {
-                let sel = sel.to_string();
-                if let Some(input) = self.input.as_mut() {
-                    input.buffer = sel;
-                }
-            }
-            self.completion_popup = Some(popup);
-        }
-    }
-
-    fn submit_input(&mut self, input: InputState) {
-        match input.kind {
-            InputKind::Command => self.run_command(input.buffer.trim()),
-            InputKind::Search => {
-                if self.focus == Focus::Sidebar {
-                    // filter already applied live
-                    return;
-                }
-                self.search_pattern = input.buffer;
-                self.repeat_search(true);
-            }
-            InputKind::Rename(target) => {
-                let new = input.buffer.trim().to_string();
-                if new.is_empty() {
-                    self.error("rename cancelled: empty name");
-                    return;
-                }
-                // Ghidra-only decompiler temporaries (pcVar8, iVar4…) have no
-                // backing rizin variable, so a real `afvn` rename can't apply —
-                // fall back to a vizin-only display alias instead of erroring.
-                if let RenameTarget::Var { fcn, old } = &target {
-                    match self.backend.is_real_variable(*fcn, old) {
-                        Ok(true) => {}
-                        Ok(false) => {
-                            self.local_aliases
-                                .entry(*fcn)
-                                .or_default()
-                                .insert(old.clone(), new.clone());
-                            self.save_aliases();
-                            self.info(format!(
-                                "'{old}' is Ghidra-only — aliased to '{new}' (display hint, not a real rizin rename)"
-                            ));
-                            return;
-                        }
-                        Err(e) => {
-                            self.error(format!("{e:#}"));
-                            return;
-                        }
-                    }
-                }
-                let res = match &target {
-                    RenameTarget::Function(addr) => {
-                        self.backend.rename_function(*addr, &new)
-                    }
-                    RenameTarget::Flag(addr) => self.backend.rename_flag(*addr, &new),
-                    RenameTarget::Var { fcn, old } => {
-                        self.backend.rename_variable(*fcn, old, &new)
-                    }
-                };
-                if let Some(cmd) = self.report(res) {
-                    self.forward_edit(cmd);
-                    self.dirty = true;
-                    self.refresh_after_edit();
-                    self.info(format!("renamed to {new}"));
-                }
-            }
-            InputKind::Comment(addr) => {
-                let text = input.buffer.trim().to_string();
-                let r = self.backend.set_comment(addr, &text);
-                if let Some(cmd) = self.report(r) {
-                    self.forward_edit(cmd);
-                    self.dirty = true;
-                    let r = self.listing.reload(&mut self.backend);
-                    self.report(r);
-                    // comment appears in the decompiler too — refresh it
-                    self.decomp_cache.clear();
-                    self.decomp_shown = None;
-                    self.info(if text.is_empty() {
-                        "comment removed".to_string()
-                    } else {
-                        "comment set".to_string()
-                    });
-                }
-            }
-        }
-    }
-
-    fn repeat_search(&mut self, forward: bool) {
+    pub fn repeat_search(&mut self, forward: bool) {
         if self.search_pattern.is_empty() {
             self.error("no search pattern (use /)");
             return;
@@ -1439,110 +1254,18 @@ impl App {
 
     // ---------- commands ----------
 
-    fn open_panel(&mut self, kind: PanelKind) {
-        match PanelView::load(kind, &mut self.backend) {
-            Ok(p) => {
-                if self.main_view != MainView::Panel && self.main_view != MainView::Hex {
-                    self.prev_view = self.main_view;
-                }
-                self.panel = Some(p);
-                self.main_view = MainView::Panel;
-                self.focus = Focus::Main;
-            }
-            Err(e) => self.error(format!("{e:#}")),
+    /// Enter an overlay view (hex/panel) over whatever's currently shown,
+    /// remembering it so `exit_overlay` can restore it.
+    pub fn enter_overlay(&mut self, view: MainView) {
+        if self.main_view != MainView::Panel && self.main_view != MainView::Hex {
+            self.prev_view = self.main_view;
         }
+        self.main_view = view;
+        self.focus = Focus::Main;
     }
 
-    fn open_hex(&mut self) {
-        match HexView::load(&mut self.backend, self.seek) {
-            Ok(h) => {
-                if self.main_view != MainView::Panel && self.main_view != MainView::Hex {
-                    self.prev_view = self.main_view;
-                }
-                self.hex = Some(h);
-                self.main_view = MainView::Hex;
-                self.focus = Focus::Main;
-            }
-            Err(e) => self.error(format!("{e:#}")),
-        }
-    }
-
-    fn run_command(&mut self, cmd: &str) {
-        if cmd.is_empty() {
-            return;
-        }
-        let (name, arg) = match cmd.split_once(char::is_whitespace) {
-            Some((n, a)) => (n, a.trim()),
-            None => (cmd, ""),
-        };
-        match name {
-            "q" => {
-                if self.dirty {
-                    self.error("unsaved changes (:w to save, :q! to discard)");
-                } else {
-                    self.quit = true;
-                }
-            }
-            "q!" => self.quit = true,
-            "w" | "wq" => {
-                let path = if arg.is_empty() {
-                    self.project_path.clone()
-                } else {
-                    Some(arg.to_string())
-                };
-                let Some(path) = path else {
-                    self.error("no project file (use :w <file.rzdb>)");
-                    return;
-                };
-                match self.backend.save_project(&path) {
-                    Ok(()) => {
-                        self.project_path = Some(path.clone());
-                        self.dirty = false;
-                        self.info(format!("project saved: {path}"));
-                        if name == "wq" {
-                            self.quit = true;
-                        }
-                    }
-                    Err(e) => self.error(format!("{e:#}")),
-                }
-            }
-            "s" | "seek" | "goto" => {
-                if arg.is_empty() {
-                    self.error("usage: :s <addr|symbol>");
-                } else {
-                    match self.backend.resolve(arg) {
-                        Ok(a) => {
-                            self.goto(a, true);
-                            self.focus = Focus::Main;
-                        }
-                        Err(e) => self.error(format!("{e:#}")),
-                    }
-                }
-            }
-            "fn" | "functions" => {
-                self.focus = Focus::Sidebar;
-            }
-            "str" | "strings" => self.open_panel(PanelKind::Strings),
-            "imp" | "imports" => self.open_panel(PanelKind::Imports),
-            "exp" | "exports" => self.open_panel(PanelKind::Exports),
-            "seg" | "segments" => self.open_panel(PanelKind::Segments),
-            "hex" => self.open_hex(),
-            "oo+" => {
-                let r = self.backend.reopen_writable();
-                if self.report(r).is_some() {
-                    self.info("reopened in write mode — patches now hit the file");
-                }
-            }
-            _ => {
-                // bare address / symbol, like :0x401234 or :main
-                match self.backend.resolve(cmd) {
-                    Ok(a) => {
-                        self.goto(a, true);
-                        self.focus = Focus::Main;
-                    }
-                    Err(_) => self.error(format!("unknown command: {cmd}")),
-                }
-            }
-        }
+    /// Leave the current overlay view, restoring whatever was shown before it.
+    const fn exit_overlay(&mut self) {
+        self.main_view = self.prev_view;
     }
 }

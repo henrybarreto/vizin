@@ -4,7 +4,7 @@
 
 use super::Scroller;
 use ratatui::prelude::*;
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear};
 
 pub struct XrefRow {
     pub addr: u64,
@@ -32,39 +32,19 @@ impl XrefsPopup {
     }
 
     pub fn render(&mut self, frame: &mut Frame, area: Rect) {
-        let w = (area.width * 3 / 4).clamp(40, 100).min(area.width);
+        let w = (area.width * 3 / 4).clamp(40, 100);
         let rows_u16: u16 = self.rows.len().try_into().unwrap_or(u16::MAX);
-        let h = rows_u16.saturating_add(2).clamp(3, 20).min(area.height);
-        let popup = Rect {
-            x: area.x + (area.width - w) / 2,
-            y: area.y + (area.height.saturating_sub(h)) / 2,
-            width: w,
-            height: h,
-        };
-        self.scroller.height = popup.height.saturating_sub(2) as usize;
-        self.scroller.ensure_visible();
-        let lines: Vec<Line> = self
-            .rows
-            .iter()
-            .enumerate()
-            .skip(self.scroller.scroll)
-            .take(self.scroller.height)
-            .map(|(pos, r)| {
-                let style = if pos == self.scroller.cursor {
-                    Style::default().bg(Color::Blue).fg(Color::White)
-                } else {
-                    Style::default().fg(Color::Gray)
-                };
-                Line::from(Span::styled(r.text.clone(), style))
-            })
-            .collect();
+        let h = rows_u16.saturating_add(2).clamp(3, 20);
+        let popup = Scroller::centered_rect(area, w, h);
         frame.render_widget(Clear, popup);
-        let para = Paragraph::new(lines).block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::Cyan))
-                .title(format!(" {} — Enter: goto, q: close ", self.title)),
-        );
-        frame.render_widget(para, popup);
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(format!(" {} — Enter: goto, q: close ", self.title));
+        let rows = &self.rows;
+        self.scroller.render_list(frame, popup, block, rows.len(), |pos, selected| {
+            let style = Scroller::row_style(selected);
+            Line::from(Span::styled(rows.get(pos).map_or_else(String::new, |r| r.text.clone()), style))
+        });
     }
 }

@@ -1,7 +1,7 @@
 //! Disassembly listing: virtualized rows built from `pdj` output, with flag
 //! headers, comments, and per-instruction-type coloring.
 
-use super::{search_lines, Scroller};
+use super::Scroller;
 use crate::backend::{Backend, Instr};
 use anyhow::Result;
 use ratatui::prelude::*;
@@ -129,7 +129,7 @@ impl ListingView {
         }
     }
 
-    pub fn search_texts(&self) -> Vec<String> {
+    fn search_texts(&self) -> Vec<String> {
         self.rows
             .iter()
             .map(|r| match r {
@@ -144,12 +144,7 @@ impl ListingView {
 
     pub fn search(&mut self, pattern: &str, forward: bool) -> bool {
         let lines = self.search_texts();
-        if let Some(idx) = search_lines(&lines, pattern, self.scroller.cursor, forward) {
-            self.scroller.set_cursor(idx);
-            true
-        } else {
-            false
-        }
+        self.scroller.search(&lines, pattern, forward)
     }
 
     /// Extract a word from the current row's display text for `*` / `#`.
@@ -167,8 +162,8 @@ impl ListingView {
             .map(ToString::to_string)
     }
 
-    fn instr_style(itype: &str) -> Style {
-        match itype {
+    fn instr_style(kind: &str) -> Style {
+        match kind {
             "call" | "ucall" | "rcall" | "icall" => Style::default().fg(Color::Yellow),
             "jmp" | "ujmp" | "rjmp" | "ijmp" => Style::default().fg(Color::Green),
             "cjmp" | "ucjmp" => Style::default().fg(Color::LightGreen),
@@ -180,43 +175,9 @@ impl ListingView {
         }
     }
 
-    /// Wrap a text string in spans, optionally highlighting every occurrence of `pat`.
-    fn highlight_spans(text: &str, base: Style, pat: Option<&str>) -> Vec<Span<'static>> {
-        let Some(pat) = pat else {
-            return vec![Span::styled(text.to_string(), base)];
-        };
-        if pat.is_empty() {
-            return vec![Span::styled(text.to_string(), base)];
-        }
-        let low = text.to_lowercase();
-        let plow = pat.to_lowercase();
-        let mut spans = Vec::new();
-        let mut start = 0;
-        while let Some(pos) = low[start..].find(&plow) {
-            let abs = start + pos;
-            if abs > start {
-                spans.push(Span::styled(text[start..abs].to_string(), base));
-            }
-            spans.push(Span::styled(
-                text[abs..abs + plow.len()].to_string(),
-                base.bg(Color::Rgb(80, 60, 0)),
-            ));
-            start = abs + plow.len();
-        }
-        if start < text.len() {
-            spans.push(Span::styled(text[start..].to_string(), base));
-        }
-        spans
-    }
-
-    pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool, title_fn: &str) {
-        self.scroller.height = area.height.saturating_sub(2) as usize;
-        self.scroller.ensure_visible();
-        let border_style = if focused {
-            Style::default().fg(Color::Cyan)
-        } else {
-            Style::default().fg(Color::DarkGray)
-        };
+    pub fn render(&mut self, frame: &mut Frame, area: Rect, focused: bool, fn_name: &str) {
+        self.scroller.begin_frame(area, 2);
+        let border_style = Scroller::border_style(focused);
         let hl = self.search_highlight.as_deref();
         let mut lines: Vec<Line> = Vec::new();
         for (pos, row) in self
@@ -236,7 +197,7 @@ impl ListingView {
                 Row::Flag(name, _) => {
                     // first span = fixed-width padding, never highlighted
                     let mut spans = vec![Span::styled("           ", base)];
-                    spans.extend(Self::highlight_spans(
+                    spans.extend(Scroller::highlight_spans(
                         &format!("{name}:"),
                         base.fg(Color::LightBlue).bold(),
                         hl,
@@ -247,27 +208,27 @@ impl ListingView {
                     let Some(ins) = self.instrs.get(*i) else {
                         continue;
                     };
-                    let mut spans = Self::highlight_spans(
+                    let mut spans = Scroller::highlight_spans(
                         &format!("{:>10x}", ins.offset),
                         base.fg(Color::DarkGray),
                         hl,
                     );
                     spans.push(Span::styled(" ", base));
-                    spans.extend(Self::highlight_spans(
+                    spans.extend(Scroller::highlight_spans(
                         &format!("{:<16}", ins.bytes),
                         base.fg(Color::DarkGray),
                         hl,
                     ));
                     spans.push(Span::styled(" ", base));
-                    spans.extend(Self::highlight_spans(
+                    spans.extend(Scroller::highlight_spans(
                         &ins.disasm,
-                        base.patch(Self::instr_style(&ins.itype)),
+                        base.patch(Self::instr_style(&ins.kind)),
                         hl,
                     ));
                     if let Some(c) = ins.comment_text() {
                         let c = c.replace('\n', " ");
                         spans.push(Span::styled("  ", base));
-                        spans.extend(Self::highlight_spans(
+                        spans.extend(Scroller::highlight_spans(
                             &format!("; {c}"),
                             base.fg(Color::Rgb(120, 160, 120)).italic(),
                             hl,
@@ -282,7 +243,7 @@ impl ListingView {
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(border_style)
-                .title(format!(" Listing — {title_fn} ")),
+                .title(format!(" Listing — {fn_name} ")),
         );
         frame.render_widget(para, area);
     }

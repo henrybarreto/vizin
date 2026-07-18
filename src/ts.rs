@@ -62,18 +62,73 @@ impl TsParser {
             _ => return None,
         };
         if matches!(byte, b'{' | b'(' | b'[') {
-            Self::scan_forward(root, code.as_bytes(), pos, open, close)
+            Self::scan_forward(code.as_bytes(), pos, open, close, |i| {
+                Self::in_string_or_comment(root, i)
+            })
         } else {
-            Self::scan_backward(root, code.as_bytes(), pos, open, close)
+            Self::scan_backward(code.as_bytes(), pos, open, close, |i| {
+                Self::in_string_or_comment(root, i)
+            })
         }
+    }
+
+    /// Scan forward from `pos` (the `open` byte) for the matching `close`,
+    /// tracking nesting depth. Positions where `skip` returns true (e.g.
+    /// inside a string/comment) are ignored. Also used by `views::decomp`'s
+    /// byte-level fallback when parsing fails.
+    pub fn scan_forward(
+        bytes: &[u8],
+        pos: usize,
+        open: u8,
+        close: u8,
+        mut skip: impl FnMut(usize) -> bool,
+    ) -> Option<usize> {
+        let mut depth: i64 = 0;
+        for (i, &b) in bytes.iter().enumerate().skip(pos) {
+            if b == open && !skip(i) {
+                depth += 1;
+            } else if b == close && !skip(i) {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+        }
+        None
+    }
+
+    /// Scan backward from `pos` (the `close` byte) for the matching `open`.
+    /// See [`Self::scan_forward`].
+    pub fn scan_backward(
+        bytes: &[u8],
+        pos: usize,
+        open: u8,
+        close: u8,
+        mut skip: impl FnMut(usize) -> bool,
+    ) -> Option<usize> {
+        let mut depth: i64 = 0;
+        for i in (0..=pos).rev() {
+            let Some(&b) = bytes.get(i) else {
+                continue;
+            };
+            if b == close && !skip(i) {
+                depth += 1;
+            } else if b == open && !skip(i) {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(i);
+                }
+            }
+        }
+        None
     }
 
     // -- Symbol at cursor -------------------------------------------------
 
     /// Determine what symbol sits under the cursor byte position.
-    pub fn symbol_at(&mut self, code: &str, pos: usize) -> TsSymbol {
+    pub fn symbol_at(&mut self, code: &str, pos: usize) -> Symbol {
         let Some(tree) = self.parse(code) else {
-            return TsSymbol::None;
+            return Symbol::None;
         };
         Self::resolve_symbol(tree.root_node(), code, pos)
     }
@@ -90,6 +145,9 @@ impl TsParser {
     // -- Scope detection --------------------------------------------------
 
     /// Byte range (start, end) of the `function_definition` containing `pos`.
+    // Not yet wired to a UI feature (no "jump to enclosing function" action
+    // exists), but tested scope-detection library surface kept for later use.
+    #[allow(dead_code)]
     pub fn enclosing_function(&mut self, code: &str, pos: usize) -> Option<(usize, usize)> {
         let tree = self.parse(code)?;
         let root = tree.root_node();
@@ -116,6 +174,9 @@ impl TsParser {
 
     /// Find all byte ranges of `name` in `code` that are identifiers
     /// (not inside strings or comments).
+    // Not yet wired to a UI feature (no "find all references" action
+    // exists), but tested reference-finding library surface kept for later use.
+    #[allow(dead_code)]
     pub fn find_references(&mut self, code: &str, name: &str) -> Vec<usize> {
         let Some(tree) = self.parse(code) else {
             return vec![];
@@ -178,13 +239,6 @@ impl TsParser {
         last
     }
 
-    /// Check if byte position is in code (not in string or comment).
-    pub fn is_code(&mut self, code: &str, pos: usize) -> bool {
-        // can't determine without a tree, so assume code
-        self.parse(code)
-            .is_none_or(|tree| !Self::in_string_or_comment(tree.root_node(), pos))
-    }
-
     // -- Internal helpers ---------------------------------------------------
 
     fn in_string_or_comment(root: Node, pos: usize) -> bool {
@@ -204,46 +258,13 @@ impl TsParser {
         }
     }
 
-    fn scan_forward(root: Node, bytes: &[u8], pos: usize, open: u8, close: u8) -> Option<usize> {
-        let mut depth: i64 = 0;
-        for (i, &b) in bytes.iter().enumerate().skip(pos) {
-            if b == open && !Self::in_string_or_comment(root, i) {
-                depth += 1;
-            } else if b == close && !Self::in_string_or_comment(root, i) {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-        }
-        None
-    }
-
-    fn scan_backward(root: Node, bytes: &[u8], pos: usize, open: u8, close: u8) -> Option<usize> {
-        let mut depth: i64 = 0;
-        for i in (0..=pos).rev() {
-            let Some(&b) = bytes.get(i) else {
-                continue;
-            };
-            if b == close && !Self::in_string_or_comment(root, i) {
-                depth += 1;
-            } else if b == open && !Self::in_string_or_comment(root, i) {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-        }
-        None
-    }
-
     fn node_text(code: &str, node: Node) -> Option<String> {
         code.get(node.byte_range()).map(ToString::to_string)
     }
 
-    fn resolve_symbol(root: Node, code: &str, pos: usize) -> TsSymbol {
+    fn resolve_symbol(root: Node, code: &str, pos: usize) -> Symbol {
         let Some(innermost) = root.named_descendant_for_byte_range(pos, pos) else {
-            return TsSymbol::None;
+            return Symbol::None;
         };
 
         let mut in_fn = false;
@@ -260,25 +281,25 @@ impl TsParser {
         }
 
         let Some(text) = Self::node_text(code, innermost) else {
-            return TsSymbol::None;
+            return Symbol::None;
         };
 
         match innermost.kind() {
             "identifier" => {
                 if let Some(parent) = innermost.parent() {
                     if parent.kind() == "call_expression" {
-                        return TsSymbol::Function { name: text, addr: 0 };
+                        return Symbol::Function { name: text, addr: 0 };
                     }
                 }
                 if in_fn {
-                    TsSymbol::Local { name: text }
+                    Symbol::Local { name: text }
                 } else {
-                    TsSymbol::Global { name: text, addr: 0 }
+                    Symbol::Global { name: text, addr: 0 }
                 }
             }
-            "type_identifier" => TsSymbol::Global { name: text, addr: 0 },
-            "parameter_identifier" => TsSymbol::Param { name: text },
-            _ => TsSymbol::None,
+            "type_identifier" => Symbol::Global { name: text, addr: 0 },
+            "parameter_identifier" => Symbol::Param { name: text },
+            _ => Symbol::None,
         }
     }
 
@@ -305,7 +326,7 @@ impl TsParser {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TsSymbol {
+pub enum Symbol {
     Function { name: String, addr: u64 },
     Global { name: String, addr: u64 },
     Local { name: String },
@@ -403,7 +424,7 @@ mod tests {
         let code = "int main() { foo(); return 0; }";
         let pos = code.find("foo").unwrap();
         let sym = p.symbol_at(code, pos);
-        assert!(matches!(sym, TsSymbol::Function { name, .. } if name == "foo"));
+        assert!(matches!(sym, Symbol::Function { name, .. } if name == "foo"));
     }
 
     #[test]
@@ -412,7 +433,7 @@ mod tests {
         let code = "int main() { int x = 1; return x; }";
         let pos = code.find("return").unwrap() + 7;
         let sym = p.symbol_at(code, pos);
-        assert!(matches!(sym, TsSymbol::Local { name } if name == "x"));
+        assert!(matches!(sym, Symbol::Local { name } if name == "x"));
     }
 
     // -- Scope tests ------------------------------------------------------
